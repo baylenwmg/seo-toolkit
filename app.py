@@ -16,12 +16,23 @@ st.set_page_config(
 # ─── CACHE FETCH ────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_sitemap(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive"
+    }
+
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, headers=headers, timeout=20)
         r.raise_for_status()
         return r.content, None
+
+    except requests.exceptions.HTTPError as e:
+        return None, f"HTTP Error: {e}"
+
     except Exception as e:
-        return None, str(e)
+        return None, f"Error: {e}"
 
 # ─── PARSER ─────────────────────────────
 def parse_sitemap_xml(content):
