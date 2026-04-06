@@ -6,9 +6,11 @@ import pandas as pd
 import gzip
 import time
 import random
+import re
 from urllib.parse import urlparse
 from datetime import datetime
 from io import BytesIO
+from bs4 import BeautifulSoup
 
 # ─── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -102,28 +104,39 @@ def display_schema(schema):
 # ─── HELPER: FETCH SITEMAP (ROBUST) ───────────────────────────────────────────
 # List of realistic browser User-Agent strings to rotate through
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15",
     "Googlebot/2.1 (+http://www.google.com/bot.html)",
     "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
     "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
 ]
 
-def build_headers(ua=None):
+def build_headers(ua=None, referer=None):
     """Build realistic browser-like request headers."""
     if ua is None:
         ua = random.choice(USER_AGENTS)
-    return {
+    
+    headers = {
         "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "no-cache",
+        "Cache-Control": "max-age=0",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
     }
+    
+    if referer:
+        headers["Referer"] = referer
+        headers["Sec-Fetch-Site"] = "same-origin"
+        
+    return headers
 
 def decode_content(response):
     """Safely decode response content, handling gzip and encoding issues."""
@@ -156,11 +169,15 @@ def fetch_sitemap(url):
     session = requests.Session()
     session.max_redirects = 10
 
+    # Determine base domain for referer
+    parsed_url = urlparse(url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}/"
+
     strategies = [
         # Strategy 1: Pretend to be Googlebot (most sites whitelist this)
         {"headers": build_headers("Googlebot/2.1 (+http://www.google.com/bot.html)"), "timeout": 20},
-        # Strategy 2: Pretend to be Chrome browser
-        {"headers": build_headers(USER_AGENTS[0]), "timeout": 20},
+        # Strategy 2: Pretend to be Chrome browser with Referer
+        {"headers": build_headers(USER_AGENTS[0], referer=base_url), "timeout": 20},
         # Strategy 3: Different browser UA
         {"headers": build_headers(USER_AGENTS[2]), "timeout": 25},
         # Strategy 4: Minimal headers
@@ -365,6 +382,66 @@ def try_fetch_robots_sitemap(base_url):
     return []
 
 
+def extract_metadata(url):
+    """
+    Crawl a page and extract metadata like business name, logo, social links, etc.
+    """
+    try:
+        r = requests.get(url, headers=build_headers(), timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, 'html.parser')
+        
+        metadata = {
+            "name": "",
+            "logo": "",
+            "phone": "",
+            "email": "",
+            "socials": [],
+            "address": ""
+        }
+        
+        # 1. Name (from title or og:site_name)
+        title = soup.find('title')
+        if title:
+            metadata["name"] = title.text.split('|')[0].split('-')[0].strip()
+        
+        og_site_name = soup.find('meta', property='og:site_name')
+        if og_site_name:
+            metadata["name"] = og_site_name.get('content')
+
+        # 2. Logo
+        og_image = soup.find('meta', property='og:image')
+        if og_image:
+            metadata["logo"] = og_image.get('content')
+        else:
+            # Try finding a logo in <img> tags
+            logo_img = soup.find('img', src=re.compile(r'logo', re.I))
+            if logo_img:
+                metadata["logo"] = logo_img.get('src')
+
+        # 3. Socials
+        social_patterns = ['facebook.com', 'twitter.com', 'instagram.com', 'linkedin.com', 'youtube.com']
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if any(pattern in href for pattern in social_patterns):
+                if href not in metadata["socials"]:
+                    metadata["socials"].append(href)
+
+        # 4. Phone/Email (basic regex)
+        text = soup.get_text()
+        email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+        if email_match:
+            metadata["email"] = email_match.group(0)
+            
+        phone_match = re.search(r'(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', text)
+        if phone_match:
+            metadata["phone"] = phone_match.group(0)
+
+        return metadata
+    except Exception:
+        return None
+
+
 # ─── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🔍 SEO Toolkit")
@@ -387,132 +464,163 @@ st.markdown("""
 # 1. SITEMAP PARSER
 # ════════════════════════════════════════════════════════════════════════════════
 if tool == "🗺️ Sitemap Parser":
-    st.header("🗺️ Sitemap Parser")
-    st.markdown("Enter any website's sitemap URL to extract and analyse all its pages.")
-    st.markdown('<div class="tip-box">💡 <b>Tip:</b> Most sitemaps are at <code>https://yourwebsite.com/sitemap.xml</code> — or check <code>https://yourwebsite.com/robots.txt</code></div>', unsafe_allow_html=True)
-
-    c1, c2 = st.columns([4, 1])
-    with c1:
-        sitemap_url = st.text_input("URL", placeholder="https://example.com/sitemap.xml", label_visibility="collapsed")
-    with c2:
-        parse_btn = st.button("🔍 Parse", use_container_width=True)
-
-    if parse_btn:
-        if not sitemap_url:
-            st.warning("Please enter a sitemap URL.")
-        elif not sitemap_url.startswith("http"):
-            st.error("Please enter a valid URL starting with https://")
-        else:
-            # Auto-fix: add /sitemap.xml if user typed just a domain
-            if sitemap_url.count('/') <= 2:
-                sitemap_url = sitemap_url.rstrip('/') + '/sitemap.xml'
-                st.info(f"Auto-corrected URL to: `{sitemap_url}`")
-
-            with st.spinner("Fetching sitemap (trying multiple methods)..."):
-                content, error, strategy_num = fetch_sitemap(sitemap_url)
-
-            if error:
-                st.error(error)
-
-                # Bonus: Try to find sitemap from robots.txt
-                base = sitemap_url.rsplit('/', 1)[0] if '/' in sitemap_url else sitemap_url
-                with st.spinner("Checking robots.txt for sitemap links..."):
-                    robot_sitemaps = try_fetch_robots_sitemap(sitemap_url)
-
-                if robot_sitemaps:
-                    st.markdown("---")
-                    st.markdown("**🤖 Found these sitemaps in robots.txt — try one of these instead:**")
-                    for sm in robot_sitemaps:
-                        st.code(sm)
-                else:
-                    domain = urlparse(sitemap_url).netloc
-                    st.markdown("---")
-                    st.markdown("**💡 Common sitemap URLs to try:**")
-                    for alt in [
-                        f"https://{domain}/sitemap.xml",
-                        f"https://{domain}/sitemap_index.xml",
-                        f"https://{domain}/sitemap1.xml",
-                        f"https://{domain}/wp-sitemap.xml",
-                        f"https://{domain}/post-sitemap.xml",
-                    ]:
-                        st.code(alt)
-            else:
-                if strategy_num == 99:
-                    st.info("ℹ️ Fetched compressed (.gz) sitemap variant.")
-                elif strategy_num > 1:
-                    st.info(f"ℹ️ Fetched successfully using fallback method #{strategy_num}.")
-
-                urls, sub_sitemaps, sitemap_type = parse_sitemap_xml(content)
-
-                if sitemap_type == "index":
-                    st.warning(f"🗂️ This is a **Sitemap Index** with **{len(sub_sitemaps)} sub-sitemaps**.")
-                    st.markdown("Copy one of the sub-sitemap URLs below and paste it back into the parser:")
-                    for s in sub_sitemaps:
-                        st.code(s)
-
-                    # Auto-parse first sub-sitemap
-                    if sub_sitemaps:
-                        st.markdown("---")
-                        st.markdown(f"**Auto-loading first sub-sitemap:** `{sub_sitemaps[0]}`")
-                        with st.spinner("Loading first sub-sitemap..."):
-                            sub_content, sub_error, _ = fetch_sitemap(sub_sitemaps[0])
-                        if not sub_error:
-                            urls, _, _ = parse_sitemap_xml(sub_content)
-                            st.success(f"✅ Loaded {len(urls)} URLs from first sub-sitemap.")
+            st.header("🗺️ Sitemap Parser")
+            
+            tab_url, tab_manual = st.tabs(["🌐 Fetch from URL", "📝 Paste XML / Upload File"])
+            
+            with tab_url:
+                st.markdown("Enter any website's sitemap URL to extract and analyse all its pages.")
+                st.markdown('<div class="tip-box">💡 <b>Tip:</b> Most sitemaps are at <code>https://yourwebsite.com/sitemap.xml</code> — or check <code>https://yourwebsite.com/robots.txt</code></div>', unsafe_allow_html=True)
+            
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    sitemap_url = st.text_input("URL", placeholder="https://example.com/sitemap.xml", label_visibility="collapsed")
+                with c2:
+                    parse_btn = st.button("🔍 Parse", use_container_width=True)
+            
+                if parse_btn:
+                    if not sitemap_url:
+                        st.warning("Please enter a sitemap URL.")
+                    elif not sitemap_url.startswith("http"):
+                        st.error("Please enter a valid URL starting with https://")
+                    else:
+                        # Auto-fix: add /sitemap.xml if user typed just a domain
+                        if sitemap_url.count('/') <= 2:
+                            sitemap_url = sitemap_url.rstrip('/') + '/sitemap.xml'
+                            st.info(f"Auto-corrected URL to: `{sitemap_url}`")
+            
+                        with st.spinner("Fetching sitemap (trying multiple methods)..."):
+                            content, error, strategy_num = fetch_sitemap(sitemap_url)
+            
+                        if error:
+                            st.error(error)
+            
+                            # Bonus: Try to find sitemap from robots.txt
+                            base = sitemap_url.rsplit('/', 1)[0] if '/' in sitemap_url else sitemap_url
+                            with st.spinner("Checking robots.txt for sitemap links..."):
+                                robot_sitemaps = try_fetch_robots_sitemap(sitemap_url)
+            
+                            if robot_sitemaps:
+                                st.markdown("---")
+                                st.markdown("**🤖 Found these sitemaps in robots.txt — try one of these instead:**")
+                                for sm in robot_sitemaps:
+                                    st.code(sm)
+                            else:
+                                domain = urlparse(sitemap_url).netloc
+                                st.markdown("---")
+                                st.markdown("**💡 Common sitemap URLs to try:**")
+                                for alt in [
+                                    f"https://{domain}/sitemap.xml",
+                                    f"https://{domain}/sitemap_index.xml",
+                                    f"https://{domain}/sitemap1.xml",
+                                    f"https://{domain}/wp-sitemap.xml",
+                                    f"https://{domain}/post-sitemap.xml",
+                                ]:
+                                    st.code(alt)
                         else:
-                            st.warning(f"Could not auto-load first sub-sitemap: {sub_error}")
-
-                elif sitemap_type.startswith("parse_error"):
-                    detail = sitemap_type.replace("parse_error:", "")
-                    st.error(f"❌ Could not parse the XML: `{detail}`\n\nThe file may not be a valid sitemap.")
-                    # Show raw snippet for debugging
-                    try:
-                        snippet = content[:500].decode('utf-8', errors='replace')
-                        with st.expander("🔍 Show raw content (first 500 chars)"):
-                            st.code(snippet)
-                    except Exception:
-                        pass
-
-                if urls:
-                    df = pd.DataFrame(urls)
-                    domain = urlparse(sitemap_url).netloc
-                    dated = (df["Last Modified"] != "N/A").sum()
-                    try:
-                        high_p = df["Priority"].apply(lambda x: float(x) >= 0.8 if x != "N/A" else False).sum()
-                    except Exception:
-                        high_p = 0
-
-                    st.markdown(f'<div class="success-banner">✅ Found <b>{len(urls)} URLs</b> from <b>{domain}</b></div>', unsafe_allow_html=True)
-                    st.markdown("")
-                    for col, val, label in zip(
-                        st.columns(4),
-                        [len(urls), int(dated), int(high_p), df["Path"].nunique()],
-                        ["Total URLs", "Have Date", "High Priority", "Unique Paths"]
-                    ):
-                        with col:
-                            st.markdown(f'<div class="stat-card"><div class="stat-number">{val}</div><div class="stat-label">{label}</div></div>', unsafe_allow_html=True)
-
-                    st.markdown("")
-                    kw = st.text_input("🔎 Filter results", placeholder="Type keyword to filter...")
-                    ddf = df[df["URL"].str.contains(kw, case=False, na=False)] if kw else df
-                    if kw:
-                        st.caption(f"Showing {len(ddf)} of {len(df)} results")
-                    st.dataframe(ddf, use_container_width=True, height=420)
-
-                    dl1, dl2 = st.columns(2)
-                    with dl1:
-                        st.download_button("⬇️ Download CSV", ddf.to_csv(index=False).encode(),
-                            f"sitemap_{domain}_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv", use_container_width=True)
-                    with dl2:
-                        st.download_button("⬇️ Download URLs (.txt)", "\n".join(ddf["URL"].tolist()),
-                            f"urls_{domain}.txt", "text/plain", use_container_width=True)
-                elif not sitemap_type.startswith("parse_error") and sitemap_type != "index":
-                    st.warning("No URLs found in this sitemap. It may be empty or use a non-standard format.")
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# 2. SCHEMA GENERATOR
-# ════════════════════════════════════════════════════════════════════════════════
+                            if strategy_num == 99:
+                                st.info("ℹ️ Fetched compressed (.gz) sitemap variant.")
+                            elif strategy_num > 1:
+                                st.info(f"ℹ️ Fetched successfully using fallback method #{strategy_num}.")
+            
+                            urls, sub_sitemaps, sitemap_type = parse_sitemap_xml(content)
+                            process_sitemap_results(urls, sub_sitemaps, sitemap_type, sitemap_url, content)
+            
+            with tab_manual:
+                st.markdown("If a website is blocking automated access (like Cloudflare), you can open the sitemap in your browser, copy the XML code, and paste it here.")
+                
+                uploaded_file = st.file_uploader("Upload Sitemap XML", type=["xml"])
+                pasted_xml = st.text_area("Or Paste XML Content Here", height=300, placeholder="<?xml version=\"1.0\" encoding=\"UTF-8\"?>...")
+                
+                manual_btn = st.button("🚀 Process Manual Input", use_container_width=True)
+            
+                if manual_btn:
+                    content = None
+                    if uploaded_file:
+                        content = uploaded_file.getvalue()
+                    elif pasted_xml:
+                        content = pasted_xml.strip()
+                    
+                    if not content:
+                        st.warning("Please upload a file or paste XML content.")
+                    else:
+                        with st.spinner("Parsing XML..."):
+                            urls, sub_sitemaps, sitemap_type = parse_sitemap_xml(content)
+                            process_sitemap_results(urls, sub_sitemaps, sitemap_type, "Manual Input", content)
+            
+            
+def process_sitemap_results(urls, sub_sitemaps, sitemap_type, source_url, raw_content):
+    if sitemap_type == "index":
+        st.warning(f"🗂️ This is a **Sitemap Index** with **{len(sub_sitemaps)} sub-sitemaps**.")
+        st.markdown("Copy one of the sub-sitemap URLs below and paste it back into the parser:")
+        for s in sub_sitemaps:
+            st.code(s)
+        
+        # Auto-parse first sub-sitemap if source is a URL
+        if sub_sitemaps and source_url != "Manual Input":
+            st.markdown("---")
+            st.markdown(f"**Auto-loading first sub-sitemap:** `{sub_sitemaps[0]}`")
+            with st.spinner("Loading first sub-sitemap..."):
+                sub_content, sub_error, _ = fetch_sitemap(sub_sitemaps[0])
+                if not sub_error:
+                    urls, _, _ = parse_sitemap_xml(sub_content)
+                    st.success(f"✅ Loaded {len(urls)} URLs from first sub-sitemap.")
+                else:
+                    st.warning(f"Could not auto-load first sub-sitemap: {sub_error}")
+    
+    elif sitemap_type.startswith("parse_error"):
+        detail = sitemap_type.replace("parse_error:", "")
+        st.error(f"❌ Could not parse the XML: `{detail}`\n\nThe file may not be a valid sitemap.")
+        # Show raw snippet for debugging
+        try:
+            snippet = raw_content[:500]
+            if isinstance(snippet, bytes):
+                snippet = snippet.decode('utf-8', errors='replace')
+            with st.expander("🔍 Show raw content (first 500 chars)"):
+                st.code(snippet)
+        except Exception:
+            pass
+    
+    if urls:
+        df = pd.DataFrame(urls)
+        domain = urlparse(source_url).netloc if source_url != "Manual Input" else "manual-input"
+        dated = (df["Last Modified"] != "N/A").sum()
+        try:
+            high_p = df["Priority"].apply(lambda x: float(x) >= 0.8 if x != "N/A" else False).sum()
+        except Exception:
+            high_p = 0
+        
+        st.markdown(f'<div class="success-banner">✅ Found <b>{len(urls)} URLs</b> from <b>{domain}</b></div>', unsafe_allow_html=True)
+        st.markdown("")
+        for col, val, label in zip(
+            st.columns(4),
+            [len(urls), int(dated), int(high_p), df["Path"].nunique()],
+            ["Total URLs", "Have Date", "High Priority", "Unique Paths"]
+        ):
+            with col:
+                st.markdown(f'<div class="stat-card"><div class="stat-number">{val}</div><div class="stat-label">{label}</div></div>', unsafe_allow_html=True)
+        
+        st.markdown("")
+        kw = st.text_input("🔎 Filter results", placeholder="Type keyword to filter...", key=f"filter_{source_url}")
+        ddf = df[df["URL"].str.contains(kw, case=False, na=False)] if kw else df
+        if kw:
+            st.caption(f"Showing {len(ddf)} of {len(df)} results")
+        st.dataframe(ddf, use_container_width=True, height=420)
+        
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            st.download_button("⬇️ Download CSV", ddf.to_csv(index=False).encode(),
+                f"sitemap_{domain}_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv", use_container_width=True)
+        with dl2:
+            st.download_button("⬇️ Download URLs (.txt)", "\n".join(ddf["URL"].tolist()),
+                f"urls_{domain}.txt", "text/plain", use_container_width=True)
+    elif not sitemap_type.startswith("parse_error") and sitemap_type != "index":
+        st.warning("No URLs found in this sitemap. It may be empty or use a non-standard format.")
+    
+    
+    # ════════════════════════════════════════════════════════════════════════════════
+    # 2. SCHEMA GENERATOR
+    # ════════════════════════════════════════════════════════════════════════════════
 elif tool == "🧩 Schema Generator":
     st.header("🧩 Schema Generator")
     st.markdown("Fill in your details to generate **Schema.org JSON-LD** — helps Google understand your website and show rich results.")
@@ -526,13 +634,28 @@ elif tool == "🧩 Schema Generator":
 
     if schema_type == "🏢 Local Business":
         st.subheader("🏢 Local Business Details")
+
+        with st.expander("✨ Auto-extract from URL"):
+            extract_url = st.text_input("Enter URL (Home Page)", placeholder="https://example.com")
+            if st.button("🔍 Extract Data"):
+                with st.spinner("Analyzing page..."):
+                    ext = extract_metadata(extract_url)
+                    if ext:
+                        st.session_state["biz_name"] = ext["name"]
+                        st.session_state["biz_phone"] = ext["phone"]
+                        st.session_state["biz_email"] = ext["email"]
+                        st.session_state["biz_website"] = extract_url
+                        st.success("Extracted! Check the fields below.")
+                    else:
+                        st.error("Could not extract data automatically.")
+
         c1, c2 = st.columns(2)
         with c1:
-            biz_name    = st.text_input("Business Name *", placeholder="Raj Electronics")
+            biz_name    = st.text_input("Business Name *", value=st.session_state.get("biz_name", ""), placeholder="Raj Electronics")
             biz_type    = st.selectbox("Business Type", ["LocalBusiness","Restaurant","Store","MedicalBusiness","HealthAndBeautyBusiness","LegalService","FinancialService","AutoDealer","HotelOrMotel","RealEstateAgent"])
-            phone       = st.text_input("Phone *", placeholder="+91 98765 43210")
-            email       = st.text_input("Email", placeholder="info@business.com")
-            website     = st.text_input("Website", placeholder="https://yourbusiness.com")
+            phone       = st.text_input("Phone *", value=st.session_state.get("biz_phone", ""), placeholder="+91 98765 43210")
+            email       = st.text_input("Email", value=st.session_state.get("biz_email", ""), placeholder="info@business.com")
+            website     = st.text_input("Website", value=st.session_state.get("biz_website", ""), placeholder="https://yourbusiness.com")
         with c2:
             street      = st.text_input("Street Address *", placeholder="123 MG Road")
             city        = st.text_input("City *", placeholder="Surat")
@@ -693,19 +816,40 @@ elif tool == "🧩 Schema Generator":
 
     elif schema_type == "🌐 Organization / Company":
         st.subheader("🌐 Organization / Company Schema")
+
+        with st.expander("✨ Auto-extract from URL"):
+            extract_url_org = st.text_input("Enter URL (Home Page)", placeholder="https://example.com", key="ext_org")
+            if st.button("🔍 Extract Data", key="btn_ext_org"):
+                with st.spinner("Analyzing page..."):
+                    ext = extract_metadata(extract_url_org)
+                    if ext:
+                        st.session_state["org_name"] = ext["name"]
+                        st.session_state["org_phone"] = ext["phone"]
+                        st.session_state["org_email"] = ext["email"]
+                        st.session_state["org_website"] = extract_url_org
+                        st.session_state["org_logo"] = ext["logo"]
+                        if ext["socials"]:
+                            st.session_state["org_socials"] = ext["socials"]
+                        st.success("Extracted! Check the fields below.")
+                    else:
+                        st.error("Could not extract data automatically.")
+
         c1, c2 = st.columns(2)
         with c1:
-            org_name    = st.text_input("Organization Name *", placeholder="Tata Consultancy Services")
+            org_name    = st.text_input("Organization Name *", value=st.session_state.get("org_name", ""), placeholder="Tata Consultancy Services")
             org_type    = st.selectbox("Type", ["Organization","Corporation","NGO","EducationalOrganization","GovernmentOrganization"])
-            org_url     = st.text_input("Website *", placeholder="https://yourcompany.com")
-            org_email   = st.text_input("Email", placeholder="info@company.com")
-            org_phone   = st.text_input("Phone", placeholder="+91 22 1234 5678")
+            org_url     = st.text_input("Website *", value=st.session_state.get("org_website", ""), placeholder="https://yourcompany.com")
+            org_email   = st.text_input("Email", value=st.session_state.get("org_email", ""), placeholder="info@company.com")
+            org_phone   = st.text_input("Phone", value=st.session_state.get("org_phone", ""), placeholder="+91 22 1234 5678")
         with c2:
-            org_logo    = st.text_input("Logo URL", placeholder="https://company.com/logo.png")
+            org_logo    = st.text_input("Logo URL", value=st.session_state.get("org_logo", ""), placeholder="https://company.com/logo.png")
             org_founded = st.text_input("Founding Year", placeholder="1995")
-            social_fb   = st.text_input("Facebook URL", placeholder="https://facebook.com/...")
-            social_tw   = st.text_input("Twitter URL", placeholder="https://twitter.com/...")
-            social_li   = st.text_input("LinkedIn URL", placeholder="https://linkedin.com/company/...")
+            
+            # Simplified social handling for internal tool
+            socials_from_state = st.session_state.get("org_socials", [])
+            social_fb   = st.text_input("Facebook URL", value=socials_from_state[0] if len(socials_from_state)>0 and "facebook" in socials_from_state[0] else "", placeholder="https://facebook.com/...")
+            social_tw   = st.text_input("Twitter URL", value=socials_from_state[1] if len(socials_from_state)>1 and "twitter" in socials_from_state[1] else "", placeholder="https://twitter.com/...")
+            social_li   = st.text_input("LinkedIn URL", value=socials_from_state[2] if len(socials_from_state)>2 and "linkedin" in socials_from_state[2] else "", placeholder="https://linkedin.com/company/...")
         org_desc = st.text_area("Description *", placeholder="Describe your organization...", height=100)
 
         if st.button("⚡ Generate Schema"):
